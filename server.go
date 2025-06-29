@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand" // Added for random number generation
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,13 +22,14 @@ import (
 
 // Operation represents a single edit operation
 type Operation struct {
-	ID        string    `json:"id" bson:"id"`
-	Type      string    `json:"type" bson:"type"` // "insert" or "delete"
-	Position  int       `json:"position" bson:"position"`
-	Character string    `json:"character,omitempty" bson:"character,omitempty"`
-	Timestamp time.Time `json:"timestamp" bson:"timestamp"`
-	UserID    string    `json:"user_id" bson:"user_id"`
-	SessionID string    `json:"session_id" bson:"session_id"`
+	ID         string    `json:"id" bson:"id"`
+	Type       string    `json:"type" bson:"type"` // "insert" or "delete"
+	Position   int       `json:"position" bson:"position"`
+	Character  string    `json:"character,omitempty" bson:"character,omitempty"`
+	CharacterID string   `json:"character_id,omitempty" bson:"character_id,omitempty"` // For delete ops
+	Timestamp  time.Time `json:"timestamp" bson:"timestamp"`
+	UserID     string    `json:"user_id" bson:"user_id"`
+	SessionID  string    `json:"session_id" bson:"session_id"`
 }
 
 // Character represents a character in the CRDT with positioning info
@@ -351,17 +354,18 @@ func (c *CRDT) generatePosition(index int) float64 {
 	}
 
 	if index <= 0 {
-		return visibleChars[0].Position / 2.0
+		// Add small random component to avoid conflicts
+		return visibleChars[0].Position / 2.0 + (rand.Float64() * 0.0001)
 	}
 	
 	if index >= len(visibleChars) {
-		return visibleChars[len(visibleChars)-1].Position + 1.0
+		return visibleChars[len(visibleChars)-1].Position + 1.0 + (rand.Float64() * 0.0001)
 	}
 	
-	// Between two positions
+	// Between two positions with small random component
 	prev := visibleChars[index-1].Position
 	next := visibleChars[index].Position
-	return (prev + next) / 2.0
+	return (prev + next) / 2.0 + (rand.Float64() * 0.0001)
 }
 
 // getVisibleCharacters returns non-deleted characters sorted by position
@@ -386,9 +390,9 @@ func (c *CRDT) sortCharacters() {
 }
 
 // markDeleted marks a character as deleted
-func (c *CRDT) markDeleted(id string) {
+func (c *CRDT) markDeleted(characterID string) {
 	for i := range c.Characters {
-		if c.Characters[i].ID == id {
+		if c.Characters[i].ID == characterID {
 			c.Characters[i].Deleted = true
 			break
 		}
@@ -500,6 +504,7 @@ func (h *Hub) CreateSession(sessionID, title, createdBy string) *Session {
 }
 
 // GetOrCreateSession gets an existing session or creates a new one
+// In GetOrCreateSession, check if session already has content
 func (h *Hub) GetOrCreateSession(sessionID, title, userID string) *Session {
 	sessionMutex := h.getSessionMutex(sessionID)
 	sessionMutex.Lock()
@@ -537,6 +542,11 @@ func (h *Hub) GetOrCreateSession(sessionID, title, userID string) *Session {
 			UpdatedAt:   time.Now(),
 			ActiveUsers: []string{},
 			CRDT:        NewCRDT(),
+		}
+	} else {
+		// IMPORTANT: Initialize CRDT if it's nil
+		if session.CRDT == nil {
+			session.CRDT = NewCRDT()
 		}
 	}
 
@@ -607,17 +617,7 @@ func (h *Hub) Run() {
 			// Add user to active users
 			h.addUserToSession(client.SessionID, client.UserID)
 
-			// Get recent operations and apply them to ensure consistency
-			since := time.Now().Add(-1 * time.Hour) // Get operations from last hour
-			recentOps, err := h.persistence.GetOperationsFromRedis(client.SessionID, since)
-			if err == nil && len(recentOps) > 0 {
-				sessionMutex := h.getSessionMutex(client.SessionID)
-				sessionMutex.Lock()
-				session.CRDT.ApplyOperations(recentOps)
-				sessionMutex.Unlock()
-			}
-
-			// Send current state to new client
+			// Send current state to new client (but don't apply operations again)
 			state := session.CRDT.GetState()
 			stateMsg, _ := json.Marshal(map[string]interface{}{
 				"type": "state",
@@ -637,7 +637,6 @@ func (h *Hub) Run() {
 			h.persistence.PublishMessage(client.SessionID, "user_joined", client.UserID, map[string]string{
 				"user_id": client.UserID,
 			})
-
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
@@ -771,45 +770,42 @@ func (h *Hub) sendSessionUsersToClient(sessionID string, client *Client) {
 	}
 }
 
-// ApplyOperation applies an operation and publishes it via Redis pub/sub
+// ApplyOperation applies an operation to the session's CRDT, persists it, and publishes it.
 func (h *Hub) ApplyOperation(op Operation) {
-	mutex := h.getSessionMutex(op.SessionID)
-	mutex.Lock()
-	session, exists := h.sessions[op.SessionID]
-	if exists && session != nil {
-		session.CRDT.ApplyOperation(op)
-		session.UpdatedAt = time.Now()
-		h.persistence.SaveOperationToRedis(op.SessionID, op)
-		h.persistence.SaveSessionToRedis(op.SessionID, session)
-	}
-	mutex.Unlock()
-	// Broadcast operation to all clients in the same session
-	opMsg, _ := json.Marshal(map[string]interface{}{
-		"type": "operation",
-		"data": op,
-	})
-	for client := range h.clients {
-		if client.SessionID == op.SessionID {
-			select {
-			case client.Send <- opMsg:
-			default:
-				close(client.Send)
-				delete(h.clients, client)
-			}
-		}
-	}
-}
+    mutex := h.getSessionMutex(op.SessionID)
+    mutex.Lock()
+    defer mutex.Unlock()
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins in this example
-	},
+    h.mu.RLock()
+    session, exists := h.sessions[op.SessionID]
+    h.mu.RUnlock()
+    if !exists || session == nil {
+        return
+    }
+
+    // Apply the operation to the CRDT
+    session.CRDT.ApplyOperation(op)
+    session.UpdatedAt = time.Now()
+
+    // Persist the operation and session
+    h.persistence.SaveOperationToRedis(op.SessionID, op)
+    h.persistence.SaveSessionToRedis(op.SessionID, session)
+    h.persistence.SaveSessionToMongoDB(session)
+
+    // Publish the operation to other clients
+    h.persistence.PublishMessage(op.SessionID, "operation", op.UserID, op)
 }
 
 // WebSocket message structure
 type Message struct {
 	Type string      `json:"type"`
 	Data interface{} `json:"data"`
+}
+
+var upgrader = websocket.Upgrader{
+    CheckOrigin: func(r *http.Request) bool {
+        return true // Allow all origins in this example
+    },
 }
 
 func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
@@ -936,6 +932,8 @@ func main() {
 	r.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(hub, w, r)
 	})
+
+	r.HandleFunc("/api/session_users", sessionUsersAPIHandler(hub)).Methods("GET")
 
 	// API endpoints
 	r.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -1215,4 +1213,65 @@ func (h *Hub) StartStaleUserCleanup(interval, maxIdle time.Duration) {
 			}
 		}
 	}()
+}
+
+
+// UserInfo represents a user for the API response
+type UserInfo struct {
+    UserID string `json:"user_id"`
+    Name   string `json:"name"`
+}
+
+// /api/session_users?session_id=...&offset=...&limit=...
+func sessionUsersAPIHandler(hub *Hub) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        sessionID := r.URL.Query().Get("session_id")
+        offsetStr := r.URL.Query().Get("offset")
+        limitStr := r.URL.Query().Get("limit")
+
+        offset := 0
+        limit := 10
+        if o, err := strconv.Atoi(offsetStr); err == nil {
+            offset = o
+        }
+        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+            limit = l
+        }
+
+        // Get session from memory (live sessions)
+        sessionMutex := hub.getSessionMutex(sessionID)
+        sessionMutex.RLock()
+        hub.mu.RLock()
+        session, exists := hub.sessions[sessionID]
+        hub.mu.RUnlock()
+        sessionMutex.RUnlock()
+
+        var users []UserInfo
+        if exists && session != nil {
+            for _, userID := range session.ActiveUsers {
+                users = append(users, UserInfo{
+                    UserID: userID,
+                    Name:   userID, // Replace with actual name if you store it
+                })
+            }
+        }
+
+        // Pagination
+        total := len(users)
+        start := offset
+        if start > total {
+            start = total
+        }
+        end := start + limit
+        if end > total {
+            end = total
+        }
+        pagedUsers := users[start:end]
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "users": pagedUsers,
+            "count": total,
+        })
+    }
 }
