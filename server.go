@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand" // Added for random number generation
+	"math/rand"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -20,16 +22,50 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+const (
+	// Connection limits
+	maxConnectionsPerSession = 200
+	maxTotalConnections     = 1000
+	
+	// Channel buffer sizes
+	clientSendBufferSize    = 512
+	hubBroadcastBufferSize  = 2048
+	
+	// Rate limiting
+	maxOpsPerSecondPerClient = 100
+	rateLimitWindow         = time.Second
+	
+	// Timeouts
+	writeTimeout = 10 * time.Second
+	readTimeout  = 60 * time.Second
+	pingInterval = 30 * time.Second
+	
+	// Resource limits
+	maxCRDTSize             = 10000000 // 10MB
+	maxOperationsPerSession = 10000
+	operationBatchSize      = 100
+)
+
+
+var globalConnectionCount int32
+
+type RateLimiter struct {
+	tokens    int
+	maxTokens int
+	lastReset time.Time
+	mu        sync.Mutex
+}
+
 // Operation represents a single edit operation
 type Operation struct {
-	ID         string    `json:"id" bson:"id"`
-	Type       string    `json:"type" bson:"type"` // "insert" or "delete"
-	Position   int       `json:"position" bson:"position"`
-	Character  string    `json:"character,omitempty" bson:"character,omitempty"`
-	CharacterID string   `json:"character_id,omitempty" bson:"character_id,omitempty"` // For delete ops
-	Timestamp  time.Time `json:"timestamp" bson:"timestamp"`
-	UserID     string    `json:"user_id" bson:"user_id"`
-	SessionID  string    `json:"session_id" bson:"session_id"`
+	ID          string    `json:"id" bson:"id"`
+	Type        string    `json:"type" bson:"type"`
+	Position    int       `json:"position" bson:"position"`
+	Character   string    `json:"character,omitempty" bson:"character,omitempty"`
+	CharacterID string    `json:"character_id,omitempty" bson:"character_id,omitempty"`
+	Timestamp   time.Time `json:"timestamp" bson:"timestamp"`
+	UserID      string    `json:"user_id" bson:"user_id"`
+	SessionID   string    `json:"session_id" bson:"session_id"`
 }
 
 // Character represents a character in the CRDT with positioning info
@@ -46,6 +82,7 @@ type Character struct {
 type CRDT struct {
 	Characters []Character `json:"characters" bson:"characters"`
 	mu         sync.RWMutex
+	sizeBytes  int64
 }
 
 // Session represents a collaborative editing session
@@ -69,22 +106,127 @@ type PubSubMessage struct {
 }
 
 // PersistenceManager handles Redis and MongoDB operations
+
+func NewRateLimiter(maxTokens int) *RateLimiter {
+	return &RateLimiter{
+		tokens:    maxTokens,
+		maxTokens: maxTokens,
+		lastReset: time.Now(),
+	}
+}
+
+
+func (rl *RateLimiter) Allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	
+	now := time.Now()
+	if now.Sub(rl.lastReset) >= rateLimitWindow {
+		rl.tokens = rl.maxTokens
+		rl.lastReset = now
+	}
+	
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
+
+// Connection pool for WebSocket clients
+type ConnectionPool struct {
+	mu               sync.RWMutex
+	sessionConns     map[string]map[*Client]bool
+	totalConnections int32
+}
+
+func NewConnectionPool() *ConnectionPool {
+	return &ConnectionPool{
+		sessionConns: make(map[string]map[*Client]bool),
+	}
+}
+
+func (cp *ConnectionPool) CanAddConnection(sessionID string) bool {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	
+	if atomic.LoadInt32(&cp.totalConnections) >= maxTotalConnections {
+		return false
+	}
+	
+	if conns, exists := cp.sessionConns[sessionID]; exists {
+		return len(conns) < maxConnectionsPerSession
+	}
+	return true
+}
+
+func (cp *ConnectionPool) AddConnection(sessionID string, client *Client) bool {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	
+	if atomic.LoadInt32(&cp.totalConnections) >= maxTotalConnections {
+		return false
+	}
+	
+	if _, exists := cp.sessionConns[sessionID]; !exists {
+		cp.sessionConns[sessionID] = make(map[*Client]bool)
+	}
+	
+	if len(cp.sessionConns[sessionID]) >= maxConnectionsPerSession {
+		return false
+	}
+	
+	cp.sessionConns[sessionID][client] = true
+	atomic.AddInt32(&cp.totalConnections, 1)
+	return true
+}
+
+func (cp *ConnectionPool) RemoveConnection(sessionID string, client *Client) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	
+	if conns, exists := cp.sessionConns[sessionID]; exists {
+		delete(conns, client)
+		atomic.AddInt32(&cp.totalConnections, -1)
+		
+		if len(conns) == 0 {
+			delete(cp.sessionConns, sessionID)
+		}
+	}
+}
+
 type PersistenceManager struct {
 	redisClient *redis.Client
 	mongoClient *mongo.Client
 	mongoDB     *mongo.Database
 	ctx         context.Context
+	
+	// Operation batching
+	opBatch      map[string][]Operation
+	opBatchMu    sync.Mutex
+	batchTicker  *time.Ticker
 }
+
+
+
 
 // NewPersistenceManager creates a new persistence manager
 func NewPersistenceManager() *PersistenceManager {
 	ctx := context.Background()
 
-	// Redis client
+	// Redis client with connection pooling
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
+		Addr:         "localhost:6379",
+		Password:     "",
+		DB:           0,
+		PoolSize:     100,            // Increased pool size
+		MinIdleConns: 10,             // Minimum idle connections
+		MaxRetries:   2,              // Reduce retries for faster failure
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolTimeout:  4 * time.Second,
 	})
 
 	// Test Redis connection
@@ -93,8 +235,15 @@ func NewPersistenceManager() *PersistenceManager {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 
-	// MongoDB client
-	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://appuser:apppassword@localhost:27017/admin"))
+	// MongoDB client with connection pooling
+	mongoOpts := options.Client().
+		ApplyURI("mongodb://appuser:apppassword@localhost:27017/admin").
+		SetMaxPoolSize(100).                    // Max connections in pool
+		SetMinPoolSize(10).                     // Min connections to maintain
+		SetMaxConnIdleTime(30 * time.Second).  // Close idle connections
+		SetServerSelectionTimeout(5 * time.Second)
+
+	mongoClient, err := mongo.Connect(ctx, mongoOpts)
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
@@ -107,13 +256,75 @@ func NewPersistenceManager() *PersistenceManager {
 
 	mongoDB := mongoClient.Database("crdt_editor")
 
-	return &PersistenceManager{
+	pm := &PersistenceManager{
 		redisClient: rdb,
 		mongoClient: mongoClient,
 		mongoDB:     mongoDB,
 		ctx:         ctx,
+		opBatch:     make(map[string][]Operation),
+		batchTicker: time.NewTicker(100 * time.Millisecond), // Batch every 100ms
+	}
+	
+	// Start batch processor
+	go pm.processBatches()
+	
+	return pm
+}
+
+// Batch processing for operations
+func (pm *PersistenceManager) processBatches() {
+	for range pm.batchTicker.C {
+		pm.flushBatches()
 	}
 }
+
+func (pm *PersistenceManager) flushBatches() {
+	pm.opBatchMu.Lock()
+	batches := pm.opBatch
+	pm.opBatch = make(map[string][]Operation)
+	pm.opBatchMu.Unlock()
+	
+	for sessionID, ops := range batches {
+		if len(ops) > 0 {
+			go pm.saveBatchedOperations(sessionID, ops)
+		}
+	}
+}
+
+
+func (pm *PersistenceManager) saveBatchedOperations(sessionID string, operations []Operation) error {
+	pipe := pm.redisClient.Pipeline()
+	key := fmt.Sprintf("operations:%s", sessionID)
+	
+	for _, op := range operations {
+		operationData, _ := json.Marshal(op)
+		score := float64(op.Timestamp.UnixNano())
+		pipe.ZAdd(pm.ctx, key, &redis.Z{Score: score, Member: operationData})
+	}
+	
+	// Keep only last N operations
+	pipe.ZRemRangeByRank(pm.ctx, key, 0, -maxOperationsPerSession-1)
+	pipe.Expire(pm.ctx, key, 24*time.Hour)
+	
+	_, err := pipe.Exec(pm.ctx)
+	return err
+}
+
+func (pm *PersistenceManager) AddOperationToBatch(sessionID string, operation Operation) {
+	pm.opBatchMu.Lock()
+	defer pm.opBatchMu.Unlock()
+	
+	pm.opBatch[sessionID] = append(pm.opBatch[sessionID], operation)
+	
+	// Force flush if batch is too large
+	if len(pm.opBatch[sessionID]) >= operationBatchSize {
+		ops := pm.opBatch[sessionID]
+		delete(pm.opBatch, sessionID)
+		go pm.saveBatchedOperations(sessionID, ops)
+	}
+}
+
+
 
 // PublishMessage publishes a message to Redis pub/sub
 func (pm *PersistenceManager) PublishMessage(sessionID string, msgType string, userID string, data interface{}) error {
@@ -306,31 +517,64 @@ func (pm *PersistenceManager) persistActiveSessions(hub *Hub) {
 // NewCRDT creates a new CRDT instance
 func NewCRDT() *CRDT {
 	return &CRDT{
-		Characters: make([]Character, 0),
+		Characters: make([]Character, 0, 1000), // Pre-allocate for performance
+		sizeBytes:  0,
 	}
 }
 
-// ApplyOperation applies an operation to the CRDT
-func (c *CRDT) ApplyOperation(op Operation) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *CRDT) CanAcceptOperation() bool {
+	return atomic.LoadInt64(&c.sizeBytes) < maxCRDTSize
+}
 
-	switch op.Type {
-	case "insert":
-		pos := c.generatePosition(op.Position)
-		char := Character{
-			ID:        op.ID,
-			Value:     op.Character,
-			Position:  pos,
-			Timestamp: op.Timestamp,
-			UserID:    op.UserID,
-			Deleted:   false,
-		}
-		c.Characters = append(c.Characters, char)
-		c.sortCharacters()
-	case "delete":
-		c.markDeleted(op.ID)
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+	EnableCompression: true,
+}
+
+// ApplyOperation applies an operation to the CRDT
+func (h *Hub) ApplyOperation(op Operation) {
+	// Rate limit check
+	atomic.AddInt64(&h.metrics.totalOps, 1)
+	
+	mutex := h.getSessionMutex(op.SessionID)
+	mutex.Lock()
+	defer mutex.Unlock()
+	
+	h.mu.RLock()
+	session, exists := h.sessions[op.SessionID]
+	h.mu.RUnlock()
+	
+	if !exists || session == nil {
+		atomic.AddInt64(&h.metrics.failedOps, 1)
+		return
 	}
+	
+	// Check CRDT size limit
+	if !session.CRDT.CanAcceptOperation() {
+		atomic.AddInt64(&h.metrics.failedOps, 1)
+		log.Printf("CRDT size limit reached for session %s", op.SessionID)
+		return
+	}
+	
+	// Apply the operation
+	session.CRDT.ApplyOperation(op)
+	session.UpdatedAt = time.Now()
+	
+	// Add to batch instead of immediate save
+	h.persistence.AddOperationToBatch(op.SessionID, op)
+	
+	// Update session in Redis (with debouncing)
+	go func() {
+		h.persistence.SaveSessionToRedis(op.SessionID, session)
+	}()
+	
+	// Publish to other clients
+	h.persistence.PublishMessage(op.SessionID, "operation", op.UserID, op)
 }
 
 // ApplyOperations applies multiple operations in timestamp order
@@ -434,35 +678,173 @@ type Client struct {
 	LastSeen     time.Time
 	hub          *Hub
 	subscription *redis.PubSub
+	rateLimiter  *RateLimiter
+	mu           sync.Mutex
 }
 
 // Hub maintains active clients and broadcasts messages
 // Add sessionMutexes for per-session locking
 type Hub struct {
-	clients       map[*Client]bool
-	sessions      map[string]*Session
-	broadcast     chan []byte
-	register      chan *Client
-	unregister    chan *Client
-	mu            sync.RWMutex
-	persistence   *PersistenceManager
-	sessionMutexes map[string]*sync.RWMutex // NEW: per-session mutexes
+	clients        map[*Client]bool
+	sessions       map[string]*Session
+	broadcast      chan []byte
+	register       chan *Client
+	unregister     chan *Client
+	mu             sync.RWMutex
+	persistence    *PersistenceManager
+	sessionMutexes map[string]*sync.RWMutex
+	connPool       *ConnectionPool
+	
+	// Performance metrics
+	metrics struct {
+		totalOps      int64
+		failedOps     int64
+		activeClients int64
+	}
 }
+
 
 // NewHub creates a new Hub
 func NewHub(persistence *PersistenceManager) *Hub {
 	hub := &Hub{
-		clients:     make(map[*Client]bool),
-		sessions:    make(map[string]*Session),
-		broadcast:   make(chan []byte),
-		register:    make(chan *Client),
-		unregister:  make(chan *Client),
-		persistence: persistence,
-		sessionMutexes: make(map[string]*sync.RWMutex), // NEW
+		clients:        make(map[*Client]bool),
+		sessions:       make(map[string]*Session),
+		broadcast:      make(chan []byte, hubBroadcastBufferSize),
+		register:       make(chan *Client, 100),
+		unregister:     make(chan *Client, 100),
+		persistence:    persistence,
+		sessionMutexes: make(map[string]*sync.RWMutex),
+		connPool:       NewConnectionPool(),
 	}
+	
+	// Start multiple worker goroutines for better concurrency
+	numWorkers := runtime.NumCPU()
+	for i := 0; i < numWorkers; i++ {
+		go hub.runWorker()
+	}
+	
 	// Start periodic persistence
 	persistence.StartPeriodicPersistence(hub)
+	
+	// Start cleanup routines
+	hub.StartStaleUserCleanup(30*time.Second, 90*time.Second)
+	hub.StartCleanupRoutine()
+	
 	return hub
+}
+
+func (h *Hub) runWorker() {
+	for {
+		select {
+		case client := <-h.register:
+			h.handleRegister(client)
+		case client := <-h.unregister:
+			h.handleUnregister(client)
+		case message := <-h.broadcast:
+			h.handleBroadcast(message)
+		}
+	}
+}
+
+func (h *Hub) handleRegister(client *Client) {
+	// Check connection limits
+	if !h.connPool.CanAddConnection(client.SessionID) {
+		log.Printf("Connection limit reached for session %s", client.SessionID)
+		client.Conn.Close()
+		return
+	}
+	
+	if !h.connPool.AddConnection(client.SessionID, client) {
+		log.Printf("Failed to add connection to pool")
+		client.Conn.Close()
+		return
+	}
+	
+	h.mu.Lock()
+	h.clients[client] = true
+	h.mu.Unlock()
+	
+	atomic.AddInt64(&h.metrics.activeClients, 1)
+	client.LastSeen = time.Now()
+	
+	session := h.GetOrCreateSession(client.SessionID, "Collaborative Document", client.UserID)
+	
+	// Setup pub/sub for this client
+	h.setupPubSubForClient(client)
+	
+	// Add user to active users
+	h.addUserToSession(client.SessionID, client.UserID)
+	
+	// Send current state asynchronously
+	go func() {
+		state := session.CRDT.GetState()
+		stateMsg, _ := json.Marshal(map[string]interface{}{
+			"type": "state",
+			"data": state,
+		})
+		
+		select {
+		case client.Send <- stateMsg:
+		case <-time.After(5 * time.Second):
+			log.Printf("Timeout sending state to client %s", client.ID)
+		}
+		
+		// Send user list
+		h.sendSessionUsersToClient(client.SessionID, client)
+	}()
+	
+	// Notify others about new user
+	h.persistence.PublishMessage(client.SessionID, "user_joined", client.UserID, map[string]string{
+		"user_id": client.UserID,
+	})
+}
+
+func (h *Hub) handleUnregister(client *Client) {
+	h.mu.Lock()
+	if _, ok := h.clients[client]; ok {
+		delete(h.clients, client)
+		close(client.Send)
+		h.mu.Unlock()
+		
+		atomic.AddInt64(&h.metrics.activeClients, -1)
+		h.connPool.RemoveConnection(client.SessionID, client)
+		
+		// Close subscription
+		if client.subscription != nil {
+			client.subscription.Close()
+		}
+		
+		// Remove user from active users
+		h.removeUserFromSession(client.SessionID, client.UserID)
+		
+		// Notify other users
+		h.persistence.PublishMessage(client.SessionID, "user_left", client.UserID, map[string]string{
+			"user_id": client.UserID,
+		})
+	} else {
+		h.mu.Unlock()
+	}
+}
+
+func (h *Hub) handleBroadcast(message []byte) {
+	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+	
+	// Send to clients without holding the lock
+	for _, client := range clients {
+		select {
+		case client.Send <- message:
+		default:
+			// Client buffer full, disconnect
+			go func(c *Client) {
+				h.unregister <- c
+			}(client)
+		}
+	}
 }
 
 // getSessionMutex returns or creates a mutex for a session
@@ -562,29 +944,29 @@ func (h *Hub) GetOrCreateSession(sessionID, title, userID string) *Session {
 
 // setupPubSubForClient sets up Redis pub/sub for a client
 func (h *Hub) setupPubSubForClient(client *Client) {
-	// Subscribe to session channel
 	channelName := fmt.Sprintf("session:%s", client.SessionID)
 	pubsub := h.persistence.redisClient.Subscribe(h.persistence.ctx, channelName)
 	client.subscription = pubsub
 	
-	// Listen for messages in a separate goroutine
 	go func() {
-		defer pubsub.Close()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in pub/sub: %v", r)
+			}
+			pubsub.Close()
+		}()
 		
 		ch := pubsub.Channel()
 		for msg := range ch {
 			var pubsubMsg PubSubMessage
 			if err := json.Unmarshal([]byte(msg.Payload), &pubsubMsg); err != nil {
-				log.Printf("Error unmarshaling pub/sub message: %v", err)
 				continue
 			}
 			
-			// Don't send messages back to the sender
 			if pubsubMsg.UserID == client.UserID {
 				continue
 			}
 			
-			// Forward message to client
 			messageBytes, _ := json.Marshal(map[string]interface{}{
 				"type": pubsubMsg.Type,
 				"data": pubsubMsg.Data,
@@ -592,10 +974,9 @@ func (h *Hub) setupPubSubForClient(client *Client) {
 			
 			select {
 			case client.Send <- messageBytes:
-			default:
-				// Client channel is full, close connection
-				h.unregister <- client
-				return
+			case <-time.After(100 * time.Millisecond):
+				// Don't block on slow clients
+				continue
 			}
 		}
 	}()
@@ -771,30 +1152,7 @@ func (h *Hub) sendSessionUsersToClient(sessionID string, client *Client) {
 }
 
 // ApplyOperation applies an operation to the session's CRDT, persists it, and publishes it.
-func (h *Hub) ApplyOperation(op Operation) {
-    mutex := h.getSessionMutex(op.SessionID)
-    mutex.Lock()
-    defer mutex.Unlock()
 
-    h.mu.RLock()
-    session, exists := h.sessions[op.SessionID]
-    h.mu.RUnlock()
-    if !exists || session == nil {
-        return
-    }
-
-    // Apply the operation to the CRDT
-    session.CRDT.ApplyOperation(op)
-    session.UpdatedAt = time.Now()
-
-    // Persist the operation and session
-    h.persistence.SaveOperationToRedis(op.SessionID, op)
-    h.persistence.SaveSessionToRedis(op.SessionID, session)
-    h.persistence.SaveSessionToMongoDB(session)
-
-    // Publish the operation to other clients
-    h.persistence.PublishMessage(op.SessionID, "operation", op.UserID, op)
-}
 
 // WebSocket message structure
 type Message struct {
@@ -802,19 +1160,51 @@ type Message struct {
 	Data interface{} `json:"data"`
 }
 
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool {
-        return true // Allow all origins in this example
-    },
+
+
+
+// ApplyOperation applies a single operation to the CRDT (CRDT-level)
+func (c *CRDT) ApplyOperation(op Operation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch op.Type {
+	case "insert":
+		// Insert character at the given position
+		pos := c.generatePosition(op.Position)
+		char := Character{
+			ID:        op.CharacterID,
+			Value:     op.Character,
+			Position:  pos,
+			Timestamp: op.Timestamp,
+			UserID:    op.UserID,
+			Deleted:   false,
+		}
+		c.Characters = append(c.Characters, char)
+		c.sortCharacters()
+		atomic.AddInt64(&c.sizeBytes, int64(len(char.Value)))
+	case "delete":
+		// Mark character as deleted
+		c.markDeleted(op.CharacterID)
+	}
 }
 
 func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	// Check global connection limit
+	if atomic.LoadInt32(&globalConnectionCount) >= maxTotalConnections {
+		http.Error(w, "Server at capacity", http.StatusServiceUnavailable)
+		return
+	}
+	
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("WebSocket upgrade error:", err)
 		return
 	}
-
+	
+	atomic.AddInt32(&globalConnectionCount, 1)
+	defer atomic.AddInt32(&globalConnectionCount, -1)
+	
 	userID := r.URL.Query().Get("user_id")
 	sessionID := r.URL.Query().Get("session_id")
 	
@@ -825,82 +1215,70 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	if sessionID == "" {
 		sessionID = "default"
 	}
-
+	
 	client := &Client{
-		ID:        fmt.Sprintf("client_%d", time.Now().UnixNano()),
-		UserID:    userID,
-		SessionID: sessionID,
-		Conn:      conn,
-		Send:      make(chan []byte, 256),
-		LastSeen:  time.Now(),
-		hub:       hub,
+		ID:          fmt.Sprintf("client_%d", time.Now().UnixNano()),
+		UserID:      userID,
+		SessionID:   sessionID,
+		Conn:        conn,
+		Send:        make(chan []byte, clientSendBufferSize),
+		LastSeen:    time.Now(),
+		hub:         hub,
+		rateLimiter: NewRateLimiter(maxOpsPerSecondPerClient),
 	}
-
+	
 	hub.register <- client
-
-	go client.writePump()
-	go client.readPump(hub)
-}
-
-func (c *Client) readPump(hub *Hub) {
-	defer func() {
-		hub.unregister <- c
-		c.Conn.Close()
+	
+	// Start goroutines with proper cleanup
+	var wg sync.WaitGroup
+	wg.Add(2)
+	
+	go func() {
+		defer wg.Done()
+		client.writePump()
 	}()
-
-	// Set read deadline and pong handler
-	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		c.LastSeen = time.Now()
-		return nil
-	})
-
-	for {
-		var msg Message
-		err := c.Conn.ReadJSON(&msg)
-		if err != nil {
-			break
-		}
-
-		c.LastSeen = time.Now()
-
-		switch msg.Type {
-		case "operation":
-			opData, _ := json.Marshal(msg.Data)
-			var op Operation
-			json.Unmarshal(opData, &op)
-			op.UserID = c.UserID
-			op.SessionID = c.SessionID
-			op.Timestamp = time.Now()
-			hub.ApplyOperation(op)
-		case "ping":
-			// Respond to ping with pong
-			pongMsg, _ := json.Marshal(map[string]string{"type": "pong"})
-			c.Send <- pongMsg
-		}
-	}
+	
+	go func() {
+		defer wg.Done()
+		client.readPump(hub)
+	}()
+	
+	// Wait for both pumps to finish
+	go func() {
+		wg.Wait()
+		hub.unregister <- client
+		conn.Close()
+	}()
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(54 * time.Second)
+	ticker := time.NewTicker(pingInterval)
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
 	}()
-
 	for {
 		select {
 		case message, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
+			// Batch multiple messages if available
 			c.Conn.WriteMessage(websocket.TextMessage, message)
-
+			// Try to batch more messages
+			n := len(c.Send)
+			for i := 0; i < n && i < 10; i++ {
+				select {
+				case msg := <-c.Send:
+					c.Conn.WriteMessage(websocket.TextMessage, msg)
+				default:
+					break
+				}
+			}
 		case <-ticker.C:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -908,7 +1286,50 @@ func (c *Client) writePump() {
 	}
 }
 
+// readPump reads messages from the WebSocket connection and processes them (Client-level)
+func (c *Client) readPump(hub *Hub) {
+	defer func() {
+		c.Conn.Close()
+	}()
+	c.Conn.SetReadLimit(65536)
+	_ = c.Conn.SetReadDeadline(time.Now().Add(readTimeout))
+	c.Conn.SetPongHandler(func(string) error {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(readTimeout))
+		return nil
+	})
+	for {
+		_, message, err := c.Conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		c.LastSeen = time.Now()
+		var msg Message
+		if err := json.Unmarshal(message, &msg); err != nil {
+			continue
+		}
+		switch msg.Type {
+		case "operation":
+			// Rate limit per client
+			if !c.rateLimiter.Allow() {
+				continue
+			}
+			opData, _ := json.Marshal(msg.Data)
+			var op Operation
+			if err := json.Unmarshal(opData, &op); err != nil {
+				continue
+			}
+			op.UserID = c.UserID
+			op.SessionID = c.SessionID
+			op.Timestamp = time.Now()
+			hub.ApplyOperation(op)
+		}
+	}
+}
+
 func main() {
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	// Initialize persistence manager
 	persistence := NewPersistenceManager()
 	defer persistence.mongoClient.Disconnect(persistence.ctx)
@@ -1108,12 +1529,22 @@ func main() {
 		})
 	})
 
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB
+	}
+	
 	// Start server
 	fmt.Println("CRDT Collaborative Editor Server starting on :8080")
 	fmt.Println("WebSocket endpoint: ws://localhost:8080/ws")
 	fmt.Println("Health check: http://localhost:8080/health")
-	
-	log.Fatal(http.ListenAndServe(":8080", r))
+	fmt.Printf("Running with %d CPU cores\n", runtime.NumCPU())
+
+	log.Fatal(server.ListenAndServe())
 }
 
 // Additional helper methods that might be useful
@@ -1218,60 +1649,60 @@ func (h *Hub) StartStaleUserCleanup(interval, maxIdle time.Duration) {
 
 // UserInfo represents a user for the API response
 type UserInfo struct {
-    UserID string `json:"user_id"`
-    Name   string `json:"name"`
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
 }
 
 // /api/session_users?session_id=...&offset=...&limit=...
 func sessionUsersAPIHandler(hub *Hub) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        sessionID := r.URL.Query().Get("session_id")
-        offsetStr := r.URL.Query().Get("offset")
-        limitStr := r.URL.Query().Get("limit")
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID := r.URL.Query().Get("session_id")
+		offsetStr := r.URL.Query().Get("offset")
+		limitStr := r.URL.Query().Get("limit")
 
-        offset := 0
-        limit := 10
-        if o, err := strconv.Atoi(offsetStr); err == nil {
-            offset = o
-        }
-        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-            limit = l
-        }
+		offset := 0
+		limit := 10
+		if o, err := strconv.Atoi(offsetStr); err == nil {
+			offset = o
+		}
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
 
-        // Get session from memory (live sessions)
-        sessionMutex := hub.getSessionMutex(sessionID)
-        sessionMutex.RLock()
-        hub.mu.RLock()
-        session, exists := hub.sessions[sessionID]
-        hub.mu.RUnlock()
-        sessionMutex.RUnlock()
+		// Get session from memory (live sessions)
+		sessionMutex := hub.getSessionMutex(sessionID)
+		sessionMutex.RLock()
+		hub.mu.RLock()
+		session, exists := hub.sessions[sessionID]
+		hub.mu.RUnlock()
+		sessionMutex.RUnlock()
 
-        var users []UserInfo
-        if exists && session != nil {
-            for _, userID := range session.ActiveUsers {
-                users = append(users, UserInfo{
-                    UserID: userID,
-                    Name:   userID, // Replace with actual name if you store it
-                })
-            }
-        }
+		var users []UserInfo
+		if exists && session != nil {
+			for _, userID := range session.ActiveUsers {
+				users = append(users, UserInfo{
+					UserID: userID,
+					Name:   userID, // Replace with actual name if you store it
+				})
+			}
+		}
 
-        // Pagination
-        total := len(users)
-        start := offset
-        if start > total {
-            start = total
-        }
-        end := start + limit
-        if end > total {
-            end = total
-        }
-        pagedUsers := users[start:end]
+		// Pagination
+		total := len(users)
+		start := offset
+		if start > total {
+			start = total
+		}
+		end := start + limit
+		if end > total {
+			end = total
+		}
+		pagedUsers := users[start:end]
 
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
-            "users": pagedUsers,
-            "count": total,
-        })
-    }
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"users": pagedUsers,
+			"count": total,
+		})
+	}
 }
